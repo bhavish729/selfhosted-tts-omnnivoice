@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 import uvicorn
@@ -145,6 +147,76 @@ async def tts(req: TTSRequest):
         "X-Batch-Size": str(result["batch_size"]),
     }
     return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible TTS endpoint for LiveKit (and any OpenAI-TTS client).
+#
+# LiveKit usage (openai plugin):
+#     from livekit.plugins import openai
+#     tts = openai.TTS(
+#         base_url="http://<host>:8000/v1",
+#         api_key="dummy",                 # not checked
+#         model="omnivoice",
+#         voice="hi",                      # <-- language code goes here
+#         response_format="pcm",           # 24 kHz mono s16le, OmniVoice-native
+#     )
+#
+# `voice` carries the OmniVoice language id (hi, bn, ta, te, mr, gu, kn, ml, pa,
+# ory, as, ur). num_step defaults to OMNIVOICE_API_NUM_STEP (8 = fast/compiled).
+# ---------------------------------------------------------------------------
+API_NUM_STEP = int(os.environ.get("OMNIVOICE_API_NUM_STEP", "8"))
+DEFAULT_LANG = os.environ.get("OMNIVOICE_API_DEFAULT_LANG", "hi")
+VALID_LANGS = set(common.INDIC_LANGS)
+
+
+class SpeechRequest(BaseModel):
+    model: str = "omnivoice"
+    input: str
+    voice: str = DEFAULT_LANG
+    response_format: str = "pcm"      # pcm | wav  (LiveKit openai plugin uses pcm)
+    speed: float = 1.0
+
+
+def _pcm_s16le(audio: np.ndarray) -> bytes:
+    """Raw 16-bit little-endian PCM (no header). Matches OpenAI 'pcm' = 24kHz mono."""
+    a = np.clip(audio, -1.0, 1.0)
+    return (a * 32767.0).astype("<i2").tobytes()
+
+
+@app.post("/v1/audio/speech")
+async def openai_speech(req: SpeechRequest):
+    if CTX is None or QUEUE is None:
+        raise HTTPException(503, "model not loaded")
+    lang = req.voice if req.voice in VALID_LANGS else DEFAULT_LANG
+    internal = TTSRequest(
+        text=req.input,
+        ref_audio_path="",      # ignored in instruct mode
+        ref_text="",
+        language_id=lang,
+        num_step=API_NUM_STEP,
+    )
+    p = Pending(req=internal, t_recv=time.perf_counter())
+    QUEUE.put_nowait(p)
+    try:
+        result = await p.future
+    except Exception as e:
+        raise HTTPException(500, f"gen_failed: {type(e).__name__}: {e}")
+    audio = result["audio"]
+    fmt = req.response_format.lower()
+    if fmt in ("pcm", "pcm16", "raw"):
+        body, media = _pcm_s16le(audio), "audio/pcm"
+    elif fmt == "wav":
+        body, media = common.audio_to_wav_bytes(audio, CTX.sampling_rate), "audio/wav"
+    else:
+        # OmniVoice only emits PCM; unsupported compressed formats fall back to wav.
+        body, media = common.audio_to_wav_bytes(audio, CTX.sampling_rate), "audio/wav"
+    return Response(content=body, media_type=media, headers={
+        "X-Gen-ms": f"{result['gen_ms']:.2f}",
+        "X-Audio-Duration-s": f"{result['audio_dur_s']:.3f}",
+        "X-Sample-Rate": str(CTX.sampling_rate),
+        "X-Language": lang,
+    })
 
 
 @app.on_event("startup")
