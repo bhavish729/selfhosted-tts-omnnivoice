@@ -61,7 +61,32 @@ them. No free 2× there. *(Clean negative result.)*
 - `num_step=8`: ~143 ms gen — fastest; the only setting that approaches 200 ms.
   STT spot-check (faster-whisper large-v3) confirmed intelligible Hindi/Indic output.
 
-### 5. Audio pipeline gotcha (fixed)
+### 5. FP8 quantization makes it *slower* — the model is overhead-bound, not compute-bound
+We tested FP8 (torchao `Float8DynamicActivationFloat8WeightConfig`, row-wise) on the
+H100 tensor cores at num_step=8:
+
+| Config | mean gen | vs its baseline | quality (STT) |
+|---|---|---|---|
+| fp16 baseline | 151.6 ms | — | correct |
+| fp16 + FP8 on `audio_heads` only (8 M) | 147.3 ms | 1.03× | identical |
+| fp16 + FP8 on `llm` (596 M) | **failed** | — | (row-wise needs bf16 weights) |
+| bf16 baseline | 171.2 ms | — | correct |
+| **bf16 + FP8 on full backbone** | **588.6 ms** | **0.29× (3.4× slower!)** | correct |
+
+Quantizing the full 596 M backbone to FP8 was **3.4× slower**, not faster. Reasons:
+1. **Tiny matmuls.** A 0.6 B model at batch-1 has matmuls far too small to saturate
+   tensor cores; wall-time is **kernel-launch + Python-dispatch overhead and the
+   sequential 8-step diffusion loop**, not FLOPs. This matches the **~57 % SM ceiling**
+   in batched serving — the GPU is never compute-bound.
+2. **Unfused fallback.** torchao's compiled FP8 kernels require torch ≥ 2.11 ("Skipping
+   import of cpp extensions ... found 2.8.0"), so FP8 ran as unfused
+   dequant→matmul→requant per layer — adding overhead with no tensor-core payoff.
+
+**Conclusion: FP8 is the wrong lever for a model this small.** The remaining latency
+lever is **CUDA-graph capture** (eliminating per-step kernel-launch overhead), not
+numeric precision. Reproduce: `bench/fp8_quant.py`, `bench/fp8_bf16.py` (need `torchao`).
+
+### 6. Audio pipeline gotcha (fixed)
 OmniVoice **voice-cloning rescales output loudness to match the reference clip.**
 A self-generated reference that comes out quiet → every cloned utterance is quiet.
 We switched to **instruct mode** (`instruct="female, indian accent"`, no reference
@@ -144,6 +169,7 @@ curl -X POST localhost:8000/tts -H 'Content-Type: application/json' \
 - ✅ Stage 1a — batched vs naive concurrency sweep (4–5× throughput from batching)
 - ✅ Stage 1b — guidance_scale latency sweep (latency-neutral)
 - ✅ Audio pipeline fix (instruct mode) + STT verification
-- 🔬 Stage 2 — FP8 quantization to cut the 143 ms model forward (in progress)
+- ✅ Stage 2 — FP8 quantization (tested; makes it 3.4× *slower* — model is overhead-bound, not compute-bound)
+- ⬜ Next — CUDA-graph capture to eliminate kernel-launch overhead (the lever the data points to)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
