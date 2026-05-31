@@ -63,6 +63,15 @@ def load_model(model_id: str = "k2-fsa/OmniVoice",
     t1 = time.perf_counter()
     sr = getattr(model, "sampling_rate", 24000)
     print(f"[common] model loaded in {t1-t0:.1f}s (sr={sr})", flush=True)
+
+    # CUDA-graph capture via torch.compile (reduce-overhead). The model is
+    # kernel-launch-overhead-bound at num_step=8, so this is the single biggest
+    # latency lever (~4.7-6x on the raw forward). Toggle with OMNIVOICE_COMPILE=1.
+    if os.environ.get("OMNIVOICE_COMPILE", "0") != "0":
+        print("[common] torch.compile(llm, mode=reduce-overhead) ...", flush=True)
+        torch.set_float32_matmul_precision("high")
+        model.llm = torch.compile(model.llm, mode="reduce-overhead", fullgraph=False)
+
     return ServerCtx(
         model=model,
         gen_cfg_cls=OmniVoiceGenerationConfig,
@@ -118,8 +127,15 @@ INSTRUCT_TEXT = os.environ.get("OMNIVOICE_INSTRUCT_TEXT", "female, indian accent
 def warmup(ctx: ServerCtx, ref_audio_dir: Path | None = None,
            steps_to_warm: tuple[int, ...] = (8, 16, 32)) -> None:
     """Run a handful of generations with mixed num_step + langs to settle cuDNN/SDPA.
-    Discards outputs. If no ref audio exists yet, uses voice-design mode."""
-    print("[common] warmup ...", flush=True)
+    Discards outputs. If no ref audio exists yet, uses voice-design mode.
+
+    OMNIVOICE_WARM_STEPS (e.g. "8") overrides the diffusion steps warmed. With
+    torch.compile enabled, warming only the step count you'll actually serve
+    keeps CUDA-graph capture from blowing past the health-check timeout."""
+    env_steps = os.environ.get("OMNIVOICE_WARM_STEPS", "")
+    if env_steps:
+        steps_to_warm = tuple(int(s) for s in env_steps.split(","))
+    print(f"[common] warmup steps={steps_to_warm} ...", flush=True)
     t0 = time.perf_counter()
     sample_text = {
         "hi": "नमस्ते, मेरा नाम आरती है।",

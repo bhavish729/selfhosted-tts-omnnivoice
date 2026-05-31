@@ -19,10 +19,17 @@ import uvicorn
 from server import common
 
 
+from concurrent.futures import ThreadPoolExecutor
+
 app = FastAPI()
 CTX: common.ServerCtx | None = None
 LOCK = asyncio.Lock()
 REF_AUDIO_DIR = Path("corpus/ref_audio")
+
+# Single dedicated worker thread: torch.compile's Triton codecache is
+# thread-affine in torch 2.8, so generation must run on the same thread the
+# model was warmed/compiled on. See batched_server.py for the same fix.
+GEN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gen")
 
 
 class TTSRequest(BaseModel):
@@ -47,8 +54,9 @@ async def tts(req: TTSRequest):
         t_start = time.perf_counter()
         queue_wait_ms = (t_start - t_recv) * 1000.0
         try:
-            audio, gen_s = await asyncio.to_thread(
-                common.generate_one,
+            loop = asyncio.get_event_loop()
+            audio, gen_s = await loop.run_in_executor(
+                GEN_EXECUTOR, common.generate_one,
                 CTX, req.text, req.language_id,
                 req.ref_audio_path, req.ref_text, req.num_step,
             )
@@ -73,7 +81,10 @@ def _startup(speaker_cache_path: Path):
     CTX = common.load_model()
     if speaker_cache_path.exists():
         common.load_speaker_cache(CTX, speaker_cache_path)
-    common.warmup(CTX, ref_audio_dir=REF_AUDIO_DIR)
+    # Warm/compile on the same dedicated thread that serves generation, so
+    # torch.compile's thread-affine Triton kernels are valid at request time.
+    fut = GEN_EXECUTOR.submit(common.warmup, CTX, REF_AUDIO_DIR)
+    fut.result()
 
 
 def main():

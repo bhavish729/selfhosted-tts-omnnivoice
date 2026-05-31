@@ -22,6 +22,8 @@ import uvicorn
 from server import common
 
 
+from concurrent.futures import ThreadPoolExecutor
+
 app = FastAPI()
 CTX: common.ServerCtx | None = None
 QUEUE: asyncio.Queue | None = None
@@ -29,6 +31,13 @@ BATCHER_TASK: asyncio.Task | None = None
 MAX_BATCH_SIZE = 8
 MAX_BATCH_WAIT_MS = 20.0
 REF_AUDIO_DIR = Path("corpus/ref_audio")
+
+# Single dedicated worker thread for all model generation. torch.compile's
+# Triton codecache is thread-affine in torch 2.8, so generation MUST run on the
+# same thread the model was warmed/compiled on. Using one pinned executor thread
+# (instead of asyncio.to_thread's arbitrary pool threads) guarantees this and
+# also serialises GPU access correctly for the single model instance.
+GEN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gen")
 
 
 class TTSRequest(BaseModel):
@@ -82,8 +91,9 @@ async def batcher_loop():
                 }
                 for p in batch
             ]
-            audios, gen_s = await asyncio.to_thread(
-                common.generate_batch, CTX, items, first.req.num_step,
+            loop = asyncio.get_event_loop()
+            audios, gen_s = await loop.run_in_executor(
+                GEN_EXECUTOR, common.generate_batch, CTX, items, first.req.num_step,
             )
             t_done = time.perf_counter()
             for p, audio in zip(batch, audios):
@@ -155,7 +165,10 @@ def _startup_sync(speaker_cache_path: Path):
     CTX = common.load_model()
     if speaker_cache_path.exists():
         common.load_speaker_cache(CTX, speaker_cache_path)
-    common.warmup(CTX, ref_audio_dir=REF_AUDIO_DIR)
+    # Warm/compile ON the same dedicated thread that will serve generation, so
+    # torch.compile's thread-affine Triton kernels are valid at request time.
+    fut = GEN_EXECUTOR.submit(common.warmup, CTX, REF_AUDIO_DIR)
+    fut.result()
 
 
 def main():

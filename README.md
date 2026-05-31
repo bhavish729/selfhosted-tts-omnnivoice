@@ -1,96 +1,198 @@
-# Self-Hosted OmniVoice TTS — H100 Benchmark & Optimization
+# Self-Hosted OmniVoice TTS — H100 Benchmark, Optimization & Deploy Runbook
 
 Benchmarking and optimizing [`k2-fsa/OmniVoice`](https://github.com/k2-fsa/OmniVoice)
 (~0.6 B params, Qwen3-0.6B backbone + diffusion audio head) for **self-hosted
-Indic-language TTS** on a single NVIDIA H100 80 GB.
+Indic-language TTS** on a single NVIDIA H100 80GB — across 12 Indic languages
+(Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, Punjabi,
+Odia, Assamese, Urdu).
 
-The goal: find the operating point that maximizes **concurrency and throughput**
-while keeping **p95 TTFB under 200 ms**, across 12 Indic languages (Hindi,
-Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia,
-Assamese, Urdu).
-
-> **TL;DR** — On one H100, OmniVoice at `num_step=8`:
-> - **Naive serving:** ~5.8 req/s at p95 TTFB **193 ms** (only config strictly < 200 ms).
-> - **Continuous batching (batch=8):** **23 req/s at p95 229 ms** (4× naive), peaking at
->   **35 req/s / 103× real-time** at higher concurrency.
-> - **CUDA graphs are the big unlock: `torch.compile(mode="reduce-overhead")` cuts the
->   model forward 4.7× (148 ms → 32 ms), quality STT-identical.** The model was almost
->   entirely kernel-launch-overhead-bound — which is also why FP8 *didn't* help (it
->   made things 3.4× slower). With graphs, even a 6.6-second utterance generates in 46 ms,
->   so every length clears 200 ms at the raw-model level with huge concurrency headroom.
+This README doubles as a **deploy runbook**: an agent (or human) can follow
+[§ Deploy from scratch](#deploy-from-scratch-on-a-fresh-h100) to reproduce the
+full result on a clean H100 in ~20 minutes.
 
 ---
 
-## Key findings
+## TL;DR — the result
 
-### 1. Batching is the single biggest lever (4–5×)
-OmniVoice's `generate()` accepts **lists natively**, so a request-queue batcher does
-real GPU-level batching. Result (num_step=8, Hindi, instruct mode, healthy audio):
+On one H100 at `num_step=8`, serving healthy Indic audio:
 
-| Mode | Concurrency | p95 TTFB | RPS | Throughput (audio-s/wall-s) | GPU SM% |
-|---|---|---|---|---|---|
-| naive | 1 | **193 ms** | 5.8 | 15× | 24 % |
-| batched8 | 2 | 209 ms | 10.2 | 27× | 23 % |
-| batched8 | 5 | **229 ms** | **23.1** | 65× | 32 % |
-| batched8 | 10 | 457 ms | 33.0 | 95× | 50 % |
-| batched8 | 20 | 693 ms | **35.3** | **103×** | 57 % |
+| Configuration | Peak RPS | p95 TTFB | Throughput | Notes |
+|---|---|---|---|---|
+| naive, fp16 | 6.7 | 193 ms @ c1 | 20× RT | baseline; serializes |
+| batched8, fp16 | 35 | 229 ms @ c5 | 103× RT | batching → ~4× |
+| **naive, compiled** | **31.6** | **163 ms @ c5** | 89× RT | **CUDA graphs alone beats fp16-batched** |
+| **batched8, compiled** | **54.1** | 453 ms @ c20 | **157× RT** | **project peak** |
 
-`batch=16` performs the same as `batch=8` — the 20 ms batch-wait window never
-assembles batches larger than ~8 at these arrival rates, so **batch=8 is the sweet spot**.
+**Three levers, ranked by payoff:**
 
-### 2. The 200 ms floor is the diffusion forward, not the server
-Steady-state latency breakdown (num_step=8, ~3 s utterance):
+1. **CUDA graphs (`torch.compile(mode="reduce-overhead")`) — the big win.** Cuts
+   the model forward **4.7–6×** (148 ms → 28 ms), quality STT-identical. The model
+   is *kernel-launch-overhead-bound*, not compute-bound. So dramatic that **naive
+   serial serving + compile (31 RPS @ p95 163 ms) clears the 200 ms SLO without a
+   batcher at all** — a major operational simplification for ≤30 RPS/pod.
+2. **Continuous batching — ~4× on its own**, stacks with compile to the 54 RPS peak.
+3. **FP8 quantization — DON'T.** Tested: made the model **3.4× *slower*** (overhead-bound model + torchao kernels need torch ≥ 2.11; fell back to unfused path). Negative result, documented below.
 
-| Component | Latency |
-|---|---|
-| Pure model `generate()` | **143 ms** |
-| + server overhead (WAV-encode, asyncio) | +20 ms → 163 ms |
-| + localhost network | +2 ms → 165 ms |
-| Request #1 cold-start (excluded) | ~210 ms |
+`guidance_scale` is **latency-neutral** (flat 145 ms across 1.0–3.0). `num_step` is
+the quality/speed dial (8 = fastest usable; 16 balanced; 32 default/best quality).
 
-To go meaningfully below 200 ms at higher concurrency you must cut the **143 ms
-model forward** — hence the FP8 / CUDA-graph experiments.
+---
 
-### 3. `guidance_scale` is latency-neutral
-Sweeping CFG scale (1.0 → 3.0) showed **flat 145 ms** throughout. OmniVoice always
-runs both conditional + unconditional passes; changing the scale just reweights
-them. No free 2× there. *(Clean negative result.)*
+## Deploy from scratch on a fresh H100
 
-### 4. `num_step` is the quality/speed dial
-- `num_step=32` (default): ~620 ms gen — best quality.
-- `num_step=16`: ~330 ms gen — balanced.
-- `num_step=8`: ~143 ms gen — fastest; the only setting that approaches 200 ms.
-  STT spot-check (faster-whisper large-v3) confirmed intelligible Hindi/Indic output.
+Tested on **JarvisLabs H100 80GB, Ubuntu 22.04, driver 580 / CUDA 13, Python 3.10**.
+Everything below assumes you SSH in as a sudo-capable user (`ubuntu` or `root`).
 
-### 5. FP8 quantization makes it *slower* — the model is overhead-bound, not compute-bound
-We tested FP8 (torchao `Float8DynamicActivationFloat8WeightConfig`, row-wise) on the
-H100 tensor cores at num_step=8:
+### 0. Connect
 
-| Config | mean gen | vs its baseline | quality (STT) |
-|---|---|---|---|
-| fp16 baseline | 151.6 ms | — | correct |
-| fp16 + FP8 on `audio_heads` only (8 M) | 147.3 ms | 1.03× | identical |
-| fp16 + FP8 on `llm` (596 M) | **failed** | — | (row-wise needs bf16 weights) |
-| bf16 baseline | 171.2 ms | — | correct |
-| **bf16 + FP8 on full backbone** | **588.6 ms** | **0.29× (3.4× slower!)** | correct |
+```bash
+ssh -o StrictHostKeyChecking=accept-new <user>@<ip>
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+# Expect: NVIDIA H100 80GB HBM3, 81559 MiB, 580.x
+```
 
-Quantizing the full 596 M backbone to FP8 was **3.4× slower**, not faster. Reasons:
-1. **Tiny matmuls.** A 0.6 B model at batch-1 has matmuls far too small to saturate
-   tensor cores; wall-time is **kernel-launch + Python-dispatch overhead and the
-   sequential 8-step diffusion loop**, not FLOPs. This matches the **~57 % SM ceiling**
-   in batched serving — the GPU is never compute-bound.
-2. **Unfused fallback.** torchao's compiled FP8 kernels require torch ≥ 2.11 ("Skipping
-   import of cpp extensions ... found 2.8.0"), so FP8 ran as unfused
-   dequant→matmul→requant per layer — adding overhead with no tensor-core payoff.
+> ⚠️ **Provider gotcha (JarvisLabs & similar):** a reboot/resume can wipe
+> `~/.ssh/authorized_keys`, change the IP, and (rarely) wedge the GPU with an
+> **Xid 154 "GPU Reset Required"** fault that only a VM reboot clears. If
+> `nvidia-smi` shows `ERR!`, reboot the VM. Storage under `/home` is persistent
+> across reboots on JarvisLabs, so code/venv/results survive.
 
-**Conclusion: FP8 is the wrong lever for a model this small.** The remaining latency
-lever is **CUDA-graph capture** (eliminating per-step kernel-launch overhead), not
-numeric precision. Reproduce: `bench/fp8_quant.py`, `bench/fp8_bf16.py` (need `torchao`).
+### 1. Get the code
 
-### 6. CUDA graphs are the real lever — 4.7× faster, quality-identical
-`torch.compile(model.llm, mode="reduce-overhead")` (which uses CUDA-graph trees to
-replay each diffusion step as one captured graph instead of thousands of individual
-kernel launches):
+```bash
+cd ~
+git clone https://github.com/bhavish729/selfhosted-tts-omnnivoice.git omnivoice-bench
+cd omnivoice-bench
+```
+
+### 2. System deps + venv
+
+```bash
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pip python3-venv ffmpeg
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+```
+
+### 3. Python deps (torch 2.8.0 + cu128 + everything)
+
+```bash
+.venv/bin/python -m pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+.venv/bin/python -m pip install omnivoice fastapi "uvicorn[standard]" httpx \
+    pandas matplotlib soundfile pynvml faster-whisper pydantic tabulate tqdm torchao
+# sanity
+.venv/bin/python -c "import torch,omnivoice,torchao; print(torch.__version__, torch.cuda.is_available())"
+# -> 2.8.0+cu128 True
+```
+
+### 4. Build the corpus (prompts only — no model needed)
+
+The 12 native-script prompt sets are in `corpus/bundled_prompts.json` (committed).
+Generate the JSONL test sets:
+
+```bash
+.venv/bin/python corpus/build_corpus.py --skip-ref      # writes corpus/prompts.jsonl (600 lines)
+grep '"language_id": "hi"' corpus/prompts.jsonl > corpus/prompts_hi.jsonl   # 50 Hindi prompts
+```
+
+> **Audio mode — IMPORTANT.** We serve in **instruct mode**
+> (`instruct="female, indian accent"`, env `OMNIVOICE_INSTRUCT=1`, the default),
+> NOT voice-cloning. Reason: OmniVoice's voice-clone path **rescales output
+> loudness to match the reference clip**, and self-generated references can come
+> out near-silent → silent clones. Instruct mode has no reference dependency and
+> produces healthy audio at identical latency. (To use voice-cloning instead, set
+> `OMNIVOICE_INSTRUCT=0` and supply loud reference clips in `corpus/ref_audio/`.)
+
+### 5. Run the production server (compiled — recommended)
+
+```bash
+OMNIVOICE_COMPILE=1 OMNIVOICE_INSTRUCT=1 OMNIVOICE_WARM_STEPS=8 \
+  .venv/bin/python -m server.batched_server --host 0.0.0.0 --port 8000 --max-batch-size 8
+```
+
+First boot compiles + CUDA-graph-captures during warmup (~10–60 s; health stays
+down until done — that's expected). Then:
+
+```bash
+curl -s -X POST localhost:8000/tts -H 'Content-Type: application/json' \
+  -d '{"text":"नमस्ते, यह एक परीक्षण है।","ref_audio_path":"x","ref_text":"x","language_id":"hi","num_step":8}' \
+  -o out.wav -D - | grep -i x-gen-ms
+# -> X-Gen-ms: ~28   (compiled; would be ~148 uncompiled)
+```
+
+For ≤30 RPS under a strict 200 ms SLO, `server/naive_server.py` (same env flags)
+is simpler and sufficient — CUDA graphs alone hit 31 RPS @ p95 163 ms.
+
+### 6. Reproduce the benchmark sweeps
+
+```bash
+# Uncompiled batched-vs-naive concurrency sweep (instruct mode)
+OMNIVOICE_INSTRUCT=1 .venv/bin/python -m bench.stage1_batched \
+    --modes naive batched8 batched16 --num-step 8 --c-max 20 \
+    --out-dir results/stage1_instruct
+
+# Compiled sweep (the headline numbers)
+OMNIVOICE_COMPILE=1 OMNIVOICE_INSTRUCT=1 OMNIVOICE_WARM_STEPS=8 \
+  .venv/bin/python -m bench.stage1_batched \
+    --modes naive batched8 batched16 --num-step 8 --c-max 20 \
+    --out-dir results/stage1_compiled
+
+# Standalone CUDA-graph latency (single + multi-length)
+.venv/bin/python bench/cudagraph.py
+.venv/bin/python bench/cudagraph_multilen.py
+
+# FP8 experiment (shows it's slower — negative result)
+.venv/bin/python bench/fp8_quant.py
+.venv/bin/python bench/fp8_bf16.py
+
+# Generate audio samples for quality review (48 WAVs, 12 langs × 4 categories)
+OMNIVOICE_INSTRUCT=1 .venv/bin/python -m bench.generate_samples --num-step 8 --out samples_final
+```
+
+Run sweeps **detached** so SSH drops don't kill them:
+```bash
+setsid bash -c 'OMNIVOICE_COMPILE=1 OMNIVOICE_INSTRUCT=1 OMNIVOICE_WARM_STEPS=8 \
+  .venv/bin/python -m bench.stage1_batched --modes naive batched8 batched16 \
+  --num-step 8 --c-max 20 --out-dir results/stage1_compiled > /tmp/sweep.log 2>&1; \
+  echo DONE >> /tmp/sweep.log' </dev/null >/dev/null 2>&1 &
+```
+
+---
+
+## Critical implementation details (read before modifying the servers)
+
+These are the non-obvious things that took debugging to get right:
+
+1. **`torch.compile` is thread-affine.** CUDA-graph trees capture on the thread
+   that first runs them. The model **must be warmed AND served on the same single
+   thread**, or every request 500s. Both servers use a dedicated
+   `ThreadPoolExecutor(max_workers=1)` (`GEN_EXECUTOR`) for warmup *and*
+   generation. **Do not** revert to `asyncio.to_thread` (arbitrary pool threads → broken graphs).
+
+2. **Compile + dynamic batch sizes churn the graph cache.** Each distinct batch
+   size (1,2,…,8) is a new input shape → a fresh CUDA-graph recapture, which
+   stalls the batcher at low concurrency (batched8 dipped to 8.7 RPS at c5 before
+   all shapes were captured, then jumped to 54 RPS at c20 once warm). **For
+   production, pad requests to a fixed batch size** to avoid recapture churn.
+
+3. **Compiled-server health check is slow.** Warmup compiles for ~10–60 s; the
+   sweep harness waits up to 900 s (`bench/stage1_batched.py`). `OMNIVOICE_WARM_STEPS=8`
+   limits warmup to the step count you actually serve (instead of 8/16/32),
+   cutting compile time.
+
+4. **Env flags** (all read in `server/common.py`):
+   - `OMNIVOICE_COMPILE=1` — enable `torch.compile(llm, mode="reduce-overhead")`
+   - `OMNIVOICE_INSTRUCT=1` — instruct mode (default; avoids voice-clone loudness bug)
+   - `OMNIVOICE_INSTRUCT_TEXT="female, indian accent"` — the instruct prompt
+   - `OMNIVOICE_WARM_STEPS=8` — diffusion steps to warm/compile
+
+---
+
+## Findings in detail
+
+### 1. CUDA graphs: 4.7–6× faster, quality-identical
+`torch.compile(model.llm, mode="reduce-overhead")`, measured per utterance length:
 
 | Utterance | Audio | Baseline gen | CUDA graph | Speedup |
 |---|---|---|---|---|
@@ -98,28 +200,45 @@ kernel launches):
 | medium | 3.4 s | 169.0 ms | 33.2 ms | **5.1×** |
 | long | 6.6 s | 172.1 ms | 46.4 ms | **3.7×** |
 
-(Single-length run measured 148 ms → 31.7 ms = 4.7× on a 3 s clip.)
+STT (faster-whisper large-v3) transcription of compiled vs baseline matches
+exactly. This proves the model was launch-overhead-bound (also why FP8 failed and
+why uncompiled SM% capped at ~57%).
 
-- **Compiled RTF is 0.007–0.013** — i.e. **75–140× real-time** for a single stream,
-  vs. ~0.05 (≈18×) uncompiled.
-- **Quality is identical** — STT transcription of compiled vs. baseline audio matches
-  exactly ("आपके खाते में 12,000 रुपए का भुगतान बकाया है").
-- **This is the proof the model was overhead-bound, not compute-bound** — exactly why
-  FP8 (finding 5) failed and the SM ceiling sat at ~57 %. Remove the per-step kernel
-  launches and ~80 % of wall-time disappears.
-- **Implication:** with graphs, even a 6.6 s utterance generates in 46 ms, so *every*
-  production length clears 200 ms at the raw-model level with large concurrency headroom.
-  One-time cost: ~19 s compile/warmup at startup; CUDA-graph trees re-capture per new
-  input shape (a few extra warmups across the length range).
+### 2. Compiled concurrency sweep (the stacked result)
+`results/stage1_compiled/stage1_index.csv`:
 
-Reproduce: `bench/cudagraph.py` (single length), `bench/cudagraph_multilen.py` (sweep).
+| Mode | c1 | c5 | c10 | c20 (peak) |
+|---|---|---|---|---|
+| naive | 5.4 RPS / 285 ms | **31.6 / 163 ms** | 31.2 / 328 ms | 31.2 / 652 ms |
+| batched8 | 4.8 / 313 ms | 8.7 / 843 ms* | 23.3 / 1049 ms | **54.1 / 453 ms** |
+| batched16 | 4.0 / 397 ms | 14.9 / 461 ms | 23.0 / 569 ms | 46.5 / 800 ms |
 
-### 7. Audio pipeline gotcha (fixed)
-OmniVoice **voice-cloning rescales output loudness to match the reference clip.**
-A self-generated reference that comes out quiet → every cloned utterance is quiet.
-We switched to **instruct mode** (`instruct="female, indian accent"`, no reference
-clip) which produces healthy audio at identical latency, verified via STT in 9/10
-testable languages. Toggle with `OMNIVOICE_INSTRUCT=0/1`.
+*the c5 dip is graph-recapture churn (detail #2). `batch=16` never beats `batch=8`.
+
+### 3. Uncompiled concurrency sweep (`results/stage1_instruct/`)
+naive peaks ~6.7 RPS; batched8 peaks 35 RPS @ 103×. Batching alone = ~4×.
+
+### 4. FP8 quantization — makes it slower (negative result)
+`results/fp8/`. torchao row-wise FP8:
+
+| Config | mean gen | vs baseline |
+|---|---|---|
+| fp16 | 151.6 ms | — |
+| fp16 + FP8 on `audio_heads` (8 M) | 147.3 ms | 1.03× |
+| bf16 | 171.2 ms | — |
+| bf16 + FP8 full backbone (596 M) | 588.6 ms | **0.29× (3.4× slower)** |
+
+0.6 B model at batch-1 → matmuls too small for tensor cores; torchao FP8 kernels
+need torch ≥ 2.11 (we're on 2.8) so they fell back to unfused dequant→matmul→requant.
+**FP8 is the wrong lever for a model this small.**
+
+### 5. guidance_scale — latency-neutral
+Flat 145 ms across gs = 1.0/1.3/1.5/2.0/3.0. OmniVoice always runs both CFG passes.
+
+### 6. Audio pipeline bug (fixed)
+Voice-clone output inherits the reference clip's loudness; self-generated refs can
+be near-silent → silent clones. Fix: instruct mode (no reference). STT-verified
+intelligible in 9/10 testable languages (Assamese/Odia unsupported by Whisper).
 
 ---
 
@@ -128,77 +247,39 @@ testable languages. Toggle with `OMNIVOICE_INSTRUCT=0/1`.
 ```
 omnivoice-bench/
 ├── server/
-│   ├── common.py            # model loader, warmup, generate_one/batch (instruct + clone modes)
-│   ├── naive_server.py      # FastAPI + asyncio.Lock (one-at-a-time baseline)
-│   └── batched_server.py    # FastAPI + asyncio.Queue continuous batcher
+│   ├── common.py            # loader, torch.compile, warmup, generate_one/batch; all env flags
+│   ├── naive_server.py      # FastAPI + asyncio.Lock + GEN_EXECUTOR (compile-safe)
+│   └── batched_server.py    # FastAPI + asyncio.Queue continuous batcher + GEN_EXECUTOR
 ├── corpus/
-│   ├── build_corpus.py      # generates prompts.jsonl + ref clips + speaker cache
-│   └── bundled_prompts.json # 12-language collections-domain phrasings (native script)
+│   ├── build_corpus.py      # --skip-ref builds prompts.jsonl without the model
+│   └── bundled_prompts.json # 12-lang native-script collections-domain phrasings
 ├── bench/
 │   ├── load_gen.py          # closed-loop async httpx load generator
 │   ├── gpu_monitor.py       # pynvml 1 Hz SM%/VRAM/power logger
-│   ├── run_sweep.py         # full mode × num_step × concurrency matrix
 │   ├── stage1_batched.py    # batched-vs-naive concurrency sweep (c1..c20)
 │   ├── stage1_guidance.py   # guidance_scale latency sweep
-│   ├── mini_sweep.py        # quick c1..c5 sanity sweep
-│   ├── generate_samples.py  # per-language audio sample generator (quality review)
-│   └── analyze.py           # report.md generator
-├── results/
-│   ├── stage1/              # original sweep (voice-clone) index
-│   └── stage1_instruct/     # clean sweep (instruct mode) index  ← canonical
-└── Makefile
+│   ├── cudagraph.py / cudagraph_multilen.py  # CUDA-graph latency
+│   ├── fp8_quant.py / fp8_bf16.py            # FP8 experiments
+│   ├── generate_samples.py  # per-language audio sample generator
+│   └── analyze.py           # report generator
+└── results/
+    ├── stage1_instruct/     # uncompiled sweep (canonical fp16)
+    ├── stage1_compiled/     # compiled sweep (headline)
+    ├── cudagraph/           # CUDA-graph latency results
+    └── fp8/                 # FP8 negative-result data
 ```
 
-## Running it
+## Production recommendation
 
-On a fresh H100 (Ubuntu 22.04, CUDA 12.8 driver ≥ 550):
-
-```bash
-cd omnivoice-bench
-python3 -m venv .venv && source .venv/bin/activate
-pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
-    --extra-index-url https://download.pytorch.org/whl/cu128
-pip install omnivoice fastapi "uvicorn[standard]" httpx pandas matplotlib \
-    soundfile pynvml faster-whisper pydantic tabulate tqdm
-
-# Build the corpus (ref clips + prompts)
-python -m corpus.build_corpus
-
-# Clean batched-vs-naive concurrency sweep at num_step=8 (instruct mode)
-OMNIVOICE_INSTRUCT=1 python -m bench.stage1_batched \
-    --modes naive batched8 batched16 --num-step 8 --c-max 20 \
-    --out-dir results/stage1_instruct
-```
-
-Each server can also be run standalone:
-
-```bash
-python -m server.batched_server --host 0.0.0.0 --port 8000 --max-batch-size 8
-curl -X POST localhost:8000/tts -H 'Content-Type: application/json' \
-  -d '{"text":"नमस्ते","ref_audio_path":"corpus/ref_audio/hi.wav","ref_text":"x","language_id":"hi","num_step":8}' \
-  -o out.wav
-```
-
-## Methodology notes / caveats
-
-- **Closed-loop load** (N in-flight held constant), not open-loop RPS — the correct
-  model for "how many concurrent calls can one GPU support."
-- **TTFB = request received → first audio byte.** OmniVoice's diffusion head emits
-  the whole clip at once (no token streaming), so TTFB = total gen time for short
-  utterances. True sub-100 ms first-audio would require a streaming/autoregressive
-  model; OmniVoice is best suited to **batch / pre-render**, not live conversational TTS.
-- Reference clips and the bundled prompt set are assistant-generated, not
-  native-speaker reviewed — quality signal is **indicative** (STT-based), not a final MOS.
-- Kannada returned blank-on-STT despite loud audio (likely a Whisper artifact); flagged.
-- All numbers from a single H100 80 GB HBM3, no STT/LLM co-tenant on the GPU.
-
-## Status
-
-- ✅ Stage 1a — batched vs naive concurrency sweep (4–5× throughput from batching)
-- ✅ Stage 1b — guidance_scale latency sweep (latency-neutral)
-- ✅ Audio pipeline fix (instruct mode) + STT verification
-- ✅ Stage 2 — FP8 quantization (tested; makes it 3.4× *slower* — model is overhead-bound, not compute-bound)
-- ✅ Stage 2 — **CUDA-graph capture: 4.7× faster (148→32 ms), quality-identical — the winning lever**
-- ⬜ Next — integrate `torch.compile` into the batched server + re-run the concurrency sweep on top of it
+- **Live interactive TTS (≤30 RPS/pod, strict 200 ms):** `naive_server.py` with
+  `OMNIVOICE_COMPILE=1`. Simplest; 31 RPS @ p95 163 ms. Scale horizontally.
+- **High throughput (batch/offline or relaxed SLO):** `batched_server.py` with
+  `OMNIVOICE_COMPILE=1 --max-batch-size 8`, padded to fixed batch size. 54 RPS / 157× RT.
+- **Do not** use FP8. **Do not** chase `guidance_scale`. **Do** keep `num_step=8`
+  unless quality review demands 16.
+- OmniVoice's diffusion head emits the whole clip at once (no token streaming), so
+  TTFB = full gen time. For sub-100 ms *first-audio* regardless of length you'd need
+  a streaming/autoregressive model; OmniVoice fits batch/pre-render and short-utterance
+  interactive use, not long-form live streaming.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

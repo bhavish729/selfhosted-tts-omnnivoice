@@ -87,7 +87,9 @@ def main():
         proc = start_server(mode, out_dir / f"{mode}_server.log",
                             env_extra={"OMP_NUM_THREADS": "8"})
         try:
-            if not wait_health(SERVER_URL, timeout_s=300.0):
+            # torch.compile + CUDA-graph capture during warmup can take minutes,
+            # so allow a generous health window.
+            if not wait_health(SERVER_URL, timeout_s=900.0):
                 print(f"[stage1] {mode}: health timeout, skipping", flush=True)
                 continue
             time.sleep(2.0)
