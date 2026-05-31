@@ -16,7 +16,7 @@ Assamese, Urdu).
 > - **CUDA graphs are the big unlock: `torch.compile(mode="reduce-overhead")` cuts the
 >   model forward 4.7× (148 ms → 32 ms), quality STT-identical.** The model was almost
 >   entirely kernel-launch-overhead-bound — which is also why FP8 *didn't* help (it
->   made things 3.4× slower). With graphs, even a 9-second utterance generates in 44 ms,
+>   made things 3.4× slower). With graphs, even a 6.6-second utterance generates in 46 ms,
 >   so every length clears 200 ms at the raw-model level with huge concurrency headroom.
 
 ---
@@ -92,23 +92,25 @@ numeric precision. Reproduce: `bench/fp8_quant.py`, `bench/fp8_bf16.py` (need `t
 replay each diffusion step as one captured graph instead of thousands of individual
 kernel launches):
 
-| Utterance | Baseline gen | CUDA graph | Speedup |
-|---|---|---|---|
-| short (~2 s) | 116.7 ms | 31.4 ms | 3.7× |
-| medium (~3 s) | 138.5 ms | 31.6 ms | 4.4× |
-| long (~6 s) | 197.9 ms | 38.5 ms | 5.1× |
-| very long (~9 s) | 286.3 ms | 44.2 ms | **6.5×** |
+| Utterance | Audio | Baseline gen | CUDA graph | Speedup |
+|---|---|---|---|---|
+| short | 2.2 s | 167.5 ms | 28.0 ms | **6.0×** |
+| medium | 3.4 s | 169.0 ms | 33.2 ms | **5.1×** |
+| long | 6.6 s | 172.1 ms | 46.4 ms | **3.7×** |
 
-- **Speedup grows with length** — CUDA graphs eliminate the *fixed* per-step launch
-  overhead, which dominates more as the sequence (and thus #launches) grows.
+(Single-length run measured 148 ms → 31.7 ms = 4.7× on a 3 s clip.)
+
+- **Compiled RTF is 0.007–0.013** — i.e. **75–140× real-time** for a single stream,
+  vs. ~0.05 (≈18×) uncompiled.
 - **Quality is identical** — STT transcription of compiled vs. baseline audio matches
   exactly ("आपके खाते में 12,000 रुपए का भुगतान बकाया है").
 - **This is the proof the model was overhead-bound, not compute-bound** — exactly why
-  FP8 (finding 5) failed and the SM ceiling sat at ~57 %. Remove the launches and 78 %
-  of wall-time disappears.
-- **Implication:** with graphs, even a 9 s utterance is 44 ms, so *every* production
-  length clears 200 ms at the raw-model level — the remaining budget is pure concurrency
-  headroom. One-time cost: ~19 s compile/warmup at startup.
+  FP8 (finding 5) failed and the SM ceiling sat at ~57 %. Remove the per-step kernel
+  launches and ~80 % of wall-time disappears.
+- **Implication:** with graphs, even a 6.6 s utterance generates in 46 ms, so *every*
+  production length clears 200 ms at the raw-model level with large concurrency headroom.
+  One-time cost: ~19 s compile/warmup at startup; CUDA-graph trees re-capture per new
+  input shape (a few extra warmups across the length range).
 
 Reproduce: `bench/cudagraph.py` (single length), `bench/cudagraph_multilen.py` (sweep).
 
