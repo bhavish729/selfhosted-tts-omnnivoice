@@ -1,0 +1,19 @@
+# Pinned per OmniVoice README (PyTorch on cu128 wheel index — install separately).
+# pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
+#     --extra-index-url https://download.pytorch.org/whl/cu128
+
+omnivoice
+fastapi
+uvicorn[standard]
+httpx
+aiohttp
+numpy
+pandas
+matplotlib
+soundfile
+pynvml
+prometheus_client
+tqdm
+faster-whisper
+pydantic
+tabulate

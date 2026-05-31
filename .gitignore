@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Virtual env anywhere in tree
+**/.venv/
+
+# Generated audio / model artifacts (large, reproducible)
+omnivoice-bench/corpus/ref_audio/*.wav
+omnivoice-bench/corpus/speaker_cache.pkl
+omnivoice-bench/samples*/
+omnivoice-bench/verify_audio/
+recordings/
+
+# Benchmark raw outputs: keep index/summary CSVs (small, valuable), drop bulky per-cell artifacts
+omnivoice-bench/results/**/*_gpu.csv
+omnivoice-bench/results/**/*_server.log
+omnivoice-bench/results/**/*_monitor.log
+omnivoice-bench/results/raw/*.log
+omnivoice-bench/results/quality_samples/
+# (stage1_index.csv, rps_index.csv, sweep_index.csv, *.summary.json, report.md are kept)
+
+# Scratch scripts created on the pod
+omnivoice-bench/regen_hi*.py
+omnivoice-bench/clone_test.py
+omnivoice-bench/isolate.py
+omnivoice-bench/checkref.py
+omnivoice-bench/check_hi.py
+omnivoice-bench/texttest.py
+omnivoice-bench/steptest.py
+omnivoice-bench/refsearch.py
+omnivoice-bench/verify_final.py
+omnivoice-bench/gen_norm.py
+omnivoice-bench/clean_instruct.py
+omnivoice-bench/lat_instruct.py
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Keep prompts.jsonl (small, reproducible) but ignore the hi subset scratch
+omnivoice-bench/corpus/prompts_hi.jsonl
+
+.claude/
+.DS_Store
