@@ -13,10 +13,11 @@ Assamese, Urdu).
 > - **Naive serving:** ~5.8 req/s at p95 TTFB **193 ms** (only config strictly < 200 ms).
 > - **Continuous batching (batch=8):** **23 req/s at p95 229 ms** (4× naive), peaking at
 >   **35 req/s / 103× real-time** at higher concurrency.
-> - The 200 ms wall is set by the **143 ms model forward** (diffusion, whole-clip),
->   not by the serving code (~20 ms overhead). The GPU is only **~57 % utilized at
->   peak**, so there is headroom that batching alone can't reach — motivating
->   CUDA-graph / FP8 work.
+> - **CUDA graphs are the big unlock: `torch.compile(mode="reduce-overhead")` cuts the
+>   model forward 4.7× (148 ms → 32 ms), quality STT-identical.** The model was almost
+>   entirely kernel-launch-overhead-bound — which is also why FP8 *didn't* help (it
+>   made things 3.4× slower). With graphs, even a 9-second utterance generates in 44 ms,
+>   so every length clears 200 ms at the raw-model level with huge concurrency headroom.
 
 ---
 
@@ -86,7 +87,32 @@ Quantizing the full 596 M backbone to FP8 was **3.4× slower**, not faster. Reas
 lever is **CUDA-graph capture** (eliminating per-step kernel-launch overhead), not
 numeric precision. Reproduce: `bench/fp8_quant.py`, `bench/fp8_bf16.py` (need `torchao`).
 
-### 6. Audio pipeline gotcha (fixed)
+### 6. CUDA graphs are the real lever — 4.7× faster, quality-identical
+`torch.compile(model.llm, mode="reduce-overhead")` (which uses CUDA-graph trees to
+replay each diffusion step as one captured graph instead of thousands of individual
+kernel launches):
+
+| Utterance | Baseline gen | CUDA graph | Speedup |
+|---|---|---|---|
+| short (~2 s) | 116.7 ms | 31.4 ms | 3.7× |
+| medium (~3 s) | 138.5 ms | 31.6 ms | 4.4× |
+| long (~6 s) | 197.9 ms | 38.5 ms | 5.1× |
+| very long (~9 s) | 286.3 ms | 44.2 ms | **6.5×** |
+
+- **Speedup grows with length** — CUDA graphs eliminate the *fixed* per-step launch
+  overhead, which dominates more as the sequence (and thus #launches) grows.
+- **Quality is identical** — STT transcription of compiled vs. baseline audio matches
+  exactly ("आपके खाते में 12,000 रुपए का भुगतान बकाया है").
+- **This is the proof the model was overhead-bound, not compute-bound** — exactly why
+  FP8 (finding 5) failed and the SM ceiling sat at ~57 %. Remove the launches and 78 %
+  of wall-time disappears.
+- **Implication:** with graphs, even a 9 s utterance is 44 ms, so *every* production
+  length clears 200 ms at the raw-model level — the remaining budget is pure concurrency
+  headroom. One-time cost: ~19 s compile/warmup at startup.
+
+Reproduce: `bench/cudagraph.py` (single length), `bench/cudagraph_multilen.py` (sweep).
+
+### 7. Audio pipeline gotcha (fixed)
 OmniVoice **voice-cloning rescales output loudness to match the reference clip.**
 A self-generated reference that comes out quiet → every cloned utterance is quiet.
 We switched to **instruct mode** (`instruct="female, indian accent"`, no reference
@@ -170,6 +196,7 @@ curl -X POST localhost:8000/tts -H 'Content-Type: application/json' \
 - ✅ Stage 1b — guidance_scale latency sweep (latency-neutral)
 - ✅ Audio pipeline fix (instruct mode) + STT verification
 - ✅ Stage 2 — FP8 quantization (tested; makes it 3.4× *slower* — model is overhead-bound, not compute-bound)
-- ⬜ Next — CUDA-graph capture to eliminate kernel-launch overhead (the lever the data points to)
+- ✅ Stage 2 — **CUDA-graph capture: 4.7× faster (148→32 ms), quality-identical — the winning lever**
+- ⬜ Next — integrate `torch.compile` into the batched server + re-run the concurrency sweep on top of it
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
